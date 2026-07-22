@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       api_path:
-        description: 'ATIS 接口路径 (例: api/metar/KLAX)'
+        description: 'ATIS 接口路径 (例: api/KLAX)'
         required: true
         type: string
 
