@@ -1,0 +1,28 @@
+name: ATIS API Proxy
+run-name: Proxy Request for ATIS
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_path:
+        description: 'ATIS 接口路径 (例: api/metar/xxxx)'
+        required: true
+        type: string
+
+jobs:
+  request_atis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request ATIS.info API
+        id: http_req
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://atis.info/${{ github.event.inputs.api_path }}"
+          method: GET
+          timeout: 10000
+
+      - name: Print Response
+        run: |
+          echo "=== Response Start ==="
+          echo "${{ steps.http_req.outputs.response }}"
+          echo "=== Response End ==="
