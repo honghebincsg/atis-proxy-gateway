@@ -13,14 +13,10 @@ jobs:
   request_atis:
     runs-on: ubuntu-latest
     steps:
-      - name: Install curl
-        run: sudo apt-get update && sudo apt-get install -y curl
-
       - name: Request ATIS.info API (Browser Spoof)
         id: http_req
         run: |
           TARGET_URL="https://atis.info/${{ github.event.inputs.api_path }}"
-          # 带完整浏览器请求头，跟随重定向，模拟真实浏览器
           curl -s -L \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
             -H "Accept: application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
@@ -33,7 +29,6 @@ jobs:
             -H "Sec-Fetch-User: ?1" \
             "$TARGET_URL" > response.json
 
-          # 获取 HTTP 状态码
           echo "status=$(curl -s -o /dev/null -w "%{http_code}" -L \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
             "$TARGET_URL")" >> $GITHUB_OUTPUT
