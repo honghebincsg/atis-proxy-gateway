@@ -13,16 +13,23 @@ jobs:
   request_atis:
     runs-on: ubuntu-latest
     steps:
+      - name: Install curl
+        run: sudo apt-get update && sudo apt-get install -y curl
+
       - name: Request ATIS.info API
         id: http_req
-        uses: fjogeleit/http-request-action@v1
-        with:
-          url: "https://atis.info/${{ github.event.inputs.api_path }}"
-          method: GET
-          timeout: 10000
-
-      - name: Print Response
         run: |
-          echo "=== Response Start ==="
-          echo "${{ steps.http_req.outputs.response }}"
-          echo "=== Response End ==="
+          # 直接把响应写入文件，避免 echo 转义问题
+          curl -s "https://atis.info/${{ github.event.inputs.api_path }}" > response.json
+          # 也把状态码存下来
+          echo "status=$(curl -s -o /dev/null -w "%{http_code}" "https://atis.info/${{ github.event.inputs.api_path }}")" >> $GITHUB_OUTPUT
+
+      - name: Upload response as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atis-response
+          path: response.json
+
+      - name: Print Status Code
+        run: |
+          echo "Status Code: ${{ steps.http_req.outputs.status }}"
