@@ -1,16 +1,25 @@
-name: ATIS API Proxy
-run-name: Proxy Request for ATIS
+name: ATIS Scheduler
+run-name: Scheduled ATIS fetch
 
+# 定时 + 手动触发都支持
 on:
+  schedule:
+    # 每 5 分钟一次（注意：GitHub 调度不精确，详见下方说明）
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       api_path:
         description: 'ATIS 接口路径 (例: api/KLAX)'
-        required: true
+        required: false
         type: string
+        default: 'api/KLAX'
+
+# 需要把抓取结果 commit 回仓库，所以开写权限
+permissions:
+  contents: write
 
 jobs:
-  request_atis:
+  fetch_atis:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +29,7 @@ jobs:
         with:
           node-version: 22
 
-      # 方案A：缓存 npm + Playwright Chromium 二进制 + node_modules，避免每次重装（27s -> ~2s）
-      # 升级 playwright 或 Chromium 版本时，请把 key 末尾 v1 升到 v2，否则会沿用旧缓存
+      # 缓存 npm + Playwright Chromium 二进制 + node_modules（命中后安装步从 27s 降到 ~13s）
       - name: Cache dependencies
         uses: actions/cache@v4
         with:
@@ -33,79 +41,93 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-atis-deps-
 
-      # 关键修复2：必须装系统依赖，否则 ubuntu-latest 上 Chromium 起不来
-      # 注意：缓存命中时 npx 会跳过 Chromium 下载，但 --with-deps 仍会按需补装系统库（无缓存、<10s）
+      # 装系统库（--with-deps，每次 ~13s，无法缓存，但后台跑无所谓）
       - name: Install Playwright & Chromium (with deps)
         run: |
           npm init -y
           npm install playwright
           npx playwright install --with-deps chromium
 
-      # 关键修复1/3/4/5/6：真正执行 node、stealth 反指纹、响应拦截抓 JSON、等数据、容错
-      - name: Run browser request to bypass CF
+      # 浏览器抓数据：撞 Cloudflare 就重试，最多 5 次，提高命中率
+      - name: Fetch ATIS (with retry)
         env:
           TARGET_URL: "https://atis.info/${{ github.event.inputs.api_path }}"
         run: |
           cat > fetch.js << 'EOF'
           const { chromium } = require('playwright');
           const fs = require('fs');
+          const TARGET = process.env.TARGET_URL || 'https://atis.info/api/KLAX';
+
+          async function tryOnce(browser) {
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              locale: 'en-US'
+            });
+            const page = await context.newPage();
+            await page.addInitScript(() => {
+              try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+            });
+            const jsonBodies = [];
+            page.on('response', async (resp) => {
+              const ct = (resp.headers()['content-type'] || '').toLowerCase();
+              if (ct.includes('application/json')) {
+                try { jsonBodies.push(await resp.text()); } catch (e) {}
+              }
+            });
+            try {
+              await page.goto(TARGET, { timeout: 60000, waitUntil: 'domcontentloaded' });
+              await page.waitForFunction(
+                () => /ATIS|KLAX|METAR/i.test((document.body && document.body.innerText) || ''),
+                { timeout: 60000 }
+              );
+            } catch (e) {
+              console.error('  wait timeout:', e.message);
+            }
+            const dataJson = jsonBodies.filter(b => /airport|KLAX|ATIS|metar/i.test(b)).pop() || null;
+            await context.close();
+            return dataJson;
+          }
 
           (async () => {
-            const url = process.env.TARGET_URL;
-            let browser;
-            try {
-              browser = await chromium.launch({
-                headless: true,
-                args: ['--disable-blink-features=AutomationControlled']
-              });
-              const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                locale: 'en-US'
-              });
-              const page = await context.newPage();
-              await page.addInitScript(() => {
-                try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
-              });
-              const jsonBodies = [];
-              page.on('response', async (resp) => {
-                const ct = (resp.headers()['content-type'] || '').toLowerCase();
-                if (ct.includes('application/json')) {
-                  try { jsonBodies.push(await resp.text()); } catch (e) {}
-                }
-              });
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--disable-blink-features=AutomationControlled']
+            });
+            let result = null;
+            for (let i = 0; i < 5 && !result; i++) {
               try {
-                await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
-                await page.waitForFunction(
-                  () => /ATIS|KLAX|METAR/i.test((document.body && document.body.innerText) || ''),
-                  { timeout: 60000 }
-                );
+                result = await tryOnce(browser);
+                if (result) console.log(`  attempt ${i+1}: 拿到真实 JSON (len=${result.length})`);
+                else console.log(`  attempt ${i+1}: 未捕获 JSON（可能 CF 拦截），重试...`);
               } catch (e) {
-                console.error('等待数据超时/失败:', e.message);
+                console.error(`  attempt ${i+1} 异常:`, e.message);
               }
-              const dataJson = jsonBodies.filter(b => /airport|KLAX|ATIS|metar/i.test(b)).pop() || jsonBodies.pop();
-              if (dataJson) {
-                fs.writeFileSync('response.json', dataJson);
-                console.log('已写入 response.json（来自拦截的 JSON 响应，长度 ' + dataJson.length + '）');
-              } else {
-                const txt = await page.evaluate(() => document.body.innerText).catch(() => '');
-                fs.writeFileSync('response.json', txt || '');
-                console.log('未捕获到 JSON 响应，已写入页面文本（可能被 CF 拦截）');
-              }
-            } catch (e) {
-              console.error('脚本异常:', e.message);
-              if (!fs.existsSync('response.json')) fs.writeFileSync('response.json', '');
-            } finally {
-              if (browser) await browser.close().catch(() => {});
+            }
+            await browser.close().catch(() => {});
+            if (result) {
+              fs.writeFileSync('response.json', result);
+              console.log('OK: 已写入 response.json');
+            } else {
+              fs.writeFileSync('response.json', '');
+              console.log('FAIL: 5 次重试均未拿到真实数据');
             }
           })();
           EOF
           node fetch.js
 
-      - name: Upload response as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: atis-response
-          path: response.json
+      # 只有抓到真实数据才 commit（避免把 CF 挑战页写进仓库）
+      - name: Commit result (only if real data)
+        run: |
+          if grep -q '"airport"' response.json; then
+            mkdir -p data
+            cp response.json data/klax.json
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/klax.json
+            git commit -m "ATIS update $(date -u +%H:%M:%SZ)" && git push || echo "push 跳过（无变化或已最新）"
+          else
+            echo "未抓到真实数据，跳过 commit（保留上次有效数据）"
+          fi
 
       - name: Print done
         run: echo "Task finished"
