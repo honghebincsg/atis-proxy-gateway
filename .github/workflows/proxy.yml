@@ -16,13 +16,27 @@ jobs:
       - name: Install curl
         run: sudo apt-get update && sudo apt-get install -y curl
 
-      - name: Request ATIS.info API
+      - name: Request ATIS.info API (Browser Spoof)
         id: http_req
         run: |
-          # 直接把响应写入文件，避免 echo 转义问题
-          curl -s "https://atis.info/${{ github.event.inputs.api_path }}" > response.json
-          # 也把状态码存下来
-          echo "status=$(curl -s -o /dev/null -w "%{http_code}" "https://atis.info/${{ github.event.inputs.api_path }}")" >> $GITHUB_OUTPUT
+          TARGET_URL="https://atis.info/${{ github.event.inputs.api_path }}"
+          # 带完整浏览器请求头，跟随重定向，模拟真实浏览器
+          curl -s -L \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
+            -H "Accept: application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            -H "Accept-Encoding: gzip, deflate, br" \
+            -H "Referer: https://atis.info/" \
+            -H "Sec-Fetch-Dest: document" \
+            -H "Sec-Fetch-Mode: navigate" \
+            -H "Sec-Fetch-Site: same-origin" \
+            -H "Sec-Fetch-User: ?1" \
+            "$TARGET_URL" > response.json
+
+          # 获取 HTTP 状态码
+          echo "status=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
+            "$TARGET_URL")" >> $GITHUB_OUTPUT
 
       - name: Upload response as artifact
         uses: actions/upload-artifact@v4
@@ -32,4 +46,4 @@ jobs:
 
       - name: Print Status Code
         run: |
-          echo "Status Code: ${{ steps.http_req.outputs.status }}"
+          echo "HTTP Status Code: ${{ steps.http_req.outputs.status }}"
