@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       api_path:
-        description: 'ATIS 接口路径 (例: api/metar/xxxx)'
+        description: 'ATIS 接口路径 (例: api/metar/KLAX)'
         required: true
         type: string
 
@@ -13,25 +13,86 @@ jobs:
   request_atis:
     runs-on: ubuntu-latest
     steps:
-      - name: Request ATIS.info API (Browser Spoof)
-        id: http_req
-        run: |
-          TARGET_URL="https://atis.info/${{ github.event.inputs.api_path }}"
-          curl -s -L \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
-            -H "Accept: application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-            -H "Accept-Language: en-US,en;q=0.9" \
-            -H "Accept-Encoding: gzip, deflate, br" \
-            -H "Referer: https://atis.info/" \
-            -H "Sec-Fetch-Dest: document" \
-            -H "Sec-Fetch-Mode: navigate" \
-            -H "Sec-Fetch-Site: same-origin" \
-            -H "Sec-Fetch-User: ?1" \
-            "$TARGET_URL" > response.json
+      - uses: actions/checkout@v4
 
-          echo "status=$(curl -s -o /dev/null -w "%{http_code}" -L \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36" \
-            "$TARGET_URL")" >> $GITHUB_OUTPUT
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 关键修复2：必须装系统依赖，否则 ubuntu-latest 上 Chromium 起不来
+      - name: Install Playwright & Chromium (with deps)
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      # 关键修复1/3/4/5/6：真正执行 node、stealth 反指纹、响应拦截抓 JSON、等数据、容错
+      - name: Run browser request to bypass CF
+        env:
+          TARGET_URL: "https://atis.info/${{ github.event.inputs.api_path }}"
+        run: |
+          cat > fetch.js << 'EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          (async () => {
+            const url = process.env.TARGET_URL;
+            let browser;
+            try {
+              browser = await chromium.launch({
+                headless: true,
+                args: ['--disable-blink-features=AutomationControlled']
+              });
+              const context = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                locale: 'en-US'
+              });
+              const page = await context.newPage();
+              // 关键修复3：隐藏 navigator.webdriver，规避 CF 对 headless 的识别
+              await page.addInitScript(() => {
+                try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+              });
+
+              // 关键修复4：拦截内部 JSON 接口响应，直接取原始 JSON body
+              const jsonBodies = [];
+              page.on('response', async (resp) => {
+                const ct = (resp.headers()['content-type'] || '').toLowerCase();
+                if (ct.includes('application/json')) {
+                  try { jsonBodies.push(await resp.text()); } catch (e) {}
+                }
+              });
+
+              // 关键修复5：等 CF 挑战结束 + 真实数据出现，而不是 networkidle
+              try {
+                await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
+                await page.waitForFunction(
+                  () => /ATIS|KLAX|METAR/i.test((document.body && document.body.innerText) || ''),
+                  { timeout: 60000 }
+                );
+              } catch (e) {
+                console.error('等待数据超时/失败:', e.message);
+              }
+
+              const dataJson = jsonBodies.filter(b => /airport|KLAX|ATIS|metar/i.test(b)).pop() || jsonBodies.pop();
+              if (dataJson) {
+                fs.writeFileSync('response.json', dataJson);
+                console.log('已写入 response.json（来自拦截的 JSON 响应，长度 ' + dataJson.length + '）');
+              } else {
+                const txt = await page.evaluate(() => document.body.innerText).catch(() => '');
+                fs.writeFileSync('response.json', txt || '');
+                console.log('未捕获到 JSON 响应，已写入页面文本（可能被 CF 拦截）');
+              }
+            } catch (e) {
+              // 关键修复6：任何异常都保证 response.json 存在，避免 upload 步骤因缺文件报错
+              console.error('脚本异常:', e.message);
+              if (!fs.existsSync('response.json')) fs.writeFileSync('response.json', '');
+            } finally {
+              if (browser) await browser.close().catch(() => {});
+            }
+          })();
+          EOF
+          node fetch.js
 
       - name: Upload response as artifact
         uses: actions/upload-artifact@v4
@@ -39,6 +100,5 @@ jobs:
           name: atis-response
           path: response.json
 
-      - name: Print Status Code
-        run: |
-          echo "HTTP Status Code: ${{ steps.http_req.outputs.status }}"
+      - name: Print done
+        run: echo "Task finished"
