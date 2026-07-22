@@ -14,7 +14,7 @@ on:
         type: string
         default: 'api/KLAX'
 
-# 需要把抓取结果 commit 回仓库，所以开写权限
+# 需要把 .gist_id（首次自动创建 Gist 后写回）commit 到仓库，所以开写权限
 permissions:
   contents: write
 
@@ -115,19 +115,53 @@ jobs:
           EOF
           node fetch.js
 
-      # 只有抓到真实数据才 commit（避免把 CF 挑战页写进仓库）
-      - name: Commit result (only if real data)
+      # 推送到 Gist（客户端从 Gist 直拉，告别每5分钟刷仓库历史）
+      # 首次运行自动创建 Gist，并把它 id 写回 .gist_id 提交；之后每次 PATCH 更新
+      - name: Push to Gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
-          if grep -q '"airport"' response.json; then
-            mkdir -p data
-            cp response.json data/klax.json
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add data/klax.json
-            git commit -m "ATIS update $(date -u +%H:%M:%SZ)" && git push || echo "push 跳过（无变化或已最新）"
-          else
-            echo "未抓到真实数据，跳过 commit（保留上次有效数据）"
+          if [ -z "$GIST_TOKEN" ]; then
+            echo "⚠️ 未设置 secret GIST_TOKEN（需 gist 权限的 PAT），跳过 Gist 推送"
+            exit 0
           fi
+          if ! grep -q '"airport"' response.json; then
+            echo "未抓到真实数据，跳过 Gist 推送（保留上次有效数据）"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import os, json, urllib.request
+          tok = os.environ['GIST_TOKEN']
+          content = open('response.json', encoding='utf-8').read()
+          headers = {
+              "Authorization": f"token {tok}",
+              "Accept": "application/vnd.github+json",
+              "Content-Type": "application/json",
+          }
+          gid = open('.gist_id').read().strip() if os.path.exists('.gist_id') else None
+          if gid:
+              payload = json.dumps({"files": {"klax.json": {"content": content}}}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/gists/{gid}", data=payload, method="PATCH", headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  print("Gist 更新 ->", r.status)
+          else:
+              payload = json.dumps({
+                  "description": "KLAX ATIS (auto-updated by GitHub Actions)",
+                  "public": True,
+                  "files": {"klax.json": {"content": content}},
+              }).encode()
+              req = urllib.request.Request(
+                  "https://api.github.com/gists", data=payload, method="POST", headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  d = json.load(r)
+                  print("Gist 创建 ->", r.status, "id=", d["id"])
+                  open('.gist_id', 'w').write(d["id"])
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .gist_id
+          git commit -m "chore: store gist id for ATIS data" && git push || echo "无变化，跳过提交"
 
       - name: Print done
         run: echo "Task finished"
