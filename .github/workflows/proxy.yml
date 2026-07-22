@@ -20,7 +20,21 @@ jobs:
         with:
           node-version: 22
 
+      # 方案A：缓存 npm + Playwright Chromium 二进制 + node_modules，避免每次重装（27s -> ~2s）
+      # 升级 playwright 或 Chromium 版本时，请把 key 末尾 v1 升到 v2，否则会沿用旧缓存
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/ms-playwright
+            node_modules
+          key: ${{ runner.os }}-atis-deps-v1
+          restore-keys: |
+            ${{ runner.os }}-atis-deps-
+
       # 关键修复2：必须装系统依赖，否则 ubuntu-latest 上 Chromium 起不来
+      # 注意：缓存命中时 npx 会跳过 Chromium 下载，但 --with-deps 仍会按需补装系统库（无缓存、<10s）
       - name: Install Playwright & Chromium (with deps)
         run: |
           npm init -y
@@ -49,12 +63,9 @@ jobs:
                 locale: 'en-US'
               });
               const page = await context.newPage();
-              // 关键修复3：隐藏 navigator.webdriver，规避 CF 对 headless 的识别
               await page.addInitScript(() => {
                 try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
               });
-
-              // 关键修复4：拦截内部 JSON 接口响应，直接取原始 JSON body
               const jsonBodies = [];
               page.on('response', async (resp) => {
                 const ct = (resp.headers()['content-type'] || '').toLowerCase();
@@ -62,8 +73,6 @@ jobs:
                   try { jsonBodies.push(await resp.text()); } catch (e) {}
                 }
               });
-
-              // 关键修复5：等 CF 挑战结束 + 真实数据出现，而不是 networkidle
               try {
                 await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
                 await page.waitForFunction(
@@ -73,7 +82,6 @@ jobs:
               } catch (e) {
                 console.error('等待数据超时/失败:', e.message);
               }
-
               const dataJson = jsonBodies.filter(b => /airport|KLAX|ATIS|metar/i.test(b)).pop() || jsonBodies.pop();
               if (dataJson) {
                 fs.writeFileSync('response.json', dataJson);
@@ -84,7 +92,6 @@ jobs:
                 console.log('未捕获到 JSON 响应，已写入页面文本（可能被 CF 拦截）');
               }
             } catch (e) {
-              // 关键修复6：任何异常都保证 response.json 存在，避免 upload 步骤因缺文件报错
               console.error('脚本异常:', e.message);
               if (!fs.existsSync('response.json')) fs.writeFileSync('response.json', '');
             } finally {
