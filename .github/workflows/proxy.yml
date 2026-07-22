@@ -4,15 +4,15 @@ run-name: Scheduled ATIS fetch
 # 定时 + 手动触发都支持
 on:
   schedule:
-    # 每 5 分钟一次（注意：GitHub 调度不精确，详见下方说明）
+    # 每 5 分钟一次（GitHub 调度不精确，详见下方说明）
     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
-      api_path:
-        description: 'ATIS 接口路径 (例: api/KLAX)'
+      stations:
+        description: '机场列表，逗号分隔 (例: KLAX,PANC,KORD,KJFK)'
         required: false
         type: string
-        default: 'api/KLAX'
+        default: 'KLAX,PANC,KORD,KJFK'
 
 # 需要把 .gist_id（首次自动创建 Gist 后写回）commit 到仓库，所以开写权限
 permissions:
@@ -21,6 +21,9 @@ permissions:
 jobs:
   fetch_atis:
     runs-on: ubuntu-latest
+    # 默认抓取全部机场；手动触发可用 inputs.stations 覆盖
+    env:
+      STATIONS: ${{ github.event.inputs.stations || 'KLAX,PANC,KORD,KJFK' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,17 +51,19 @@ jobs:
           npm install playwright
           npx playwright install --with-deps chromium
 
-      # 浏览器抓数据：撞 Cloudflare 就重试，最多 5 次，提高命中率
-      - name: Fetch ATIS (with retry)
-        env:
-          TARGET_URL: "https://atis.info/${{ github.event.inputs.api_path }}"
+      # 浏览器抓数据：对每个机场串行抓取，撞 Cloudflare 就重试，最多 5 次，提高命中率
+      # 成功写 data/{小写机场码}.json；失败的机场不写文件（保留 Gist 上次有效值）
+      - name: Fetch ATIS for all stations (with retry)
         run: |
           cat > fetch.js << 'EOF'
           const { chromium } = require('playwright');
           const fs = require('fs');
-          const TARGET = process.env.TARGET_URL || 'https://atis.info/api/KLAX';
+          const path = require('path');
+          const STATIONS = (process.env.STATIONS || 'KLAX')
+            .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 
-          async function tryOnce(browser) {
+          async function tryOnce(browser, station) {
+            const url = `https://atis.info/api/${station}`;
             const context = await browser.newContext({
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
               locale: 'en-US'
@@ -75,48 +80,50 @@ jobs:
               }
             });
             try {
-              await page.goto(TARGET, { timeout: 60000, waitUntil: 'domcontentloaded' });
+              await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
               await page.waitForFunction(
-                () => /ATIS|KLAX|METAR/i.test((document.body && document.body.innerText) || ''),
+                () => /ATIS|METAR|airport/i.test((document.body && document.body.innerText) || ''),
                 { timeout: 60000 }
               );
             } catch (e) {
-              console.error('  wait timeout:', e.message);
+              console.error(`  [${station}] wait timeout:`, e.message);
             }
-            const dataJson = jsonBodies.filter(b => /airport|KLAX|ATIS|metar/i.test(b)).pop() || null;
+            const dataJson = jsonBodies.filter(b => /airport|ATIS|metar/i.test(b)).pop() || null;
             await context.close();
             return dataJson;
           }
 
           (async () => {
+            fs.mkdirSync('data', { recursive: true });
             const browser = await chromium.launch({
               headless: true,
               args: ['--disable-blink-features=AutomationControlled']
             });
-            let result = null;
-            for (let i = 0; i < 5 && !result; i++) {
-              try {
-                result = await tryOnce(browser);
-                if (result) console.log(`  attempt ${i+1}: 拿到真实 JSON (len=${result.length})`);
-                else console.log(`  attempt ${i+1}: 未捕获 JSON（可能 CF 拦截），重试...`);
-              } catch (e) {
-                console.error(`  attempt ${i+1} 异常:`, e.message);
+            for (const station of STATIONS) {
+              let result = null;
+              for (let i = 0; i < 5 && !result; i++) {
+                try {
+                  result = await tryOnce(browser, station);
+                  if (result) console.log(`  [${station}] attempt ${i+1}: 拿到真实 JSON (len=${result.length})`);
+                  else console.log(`  [${station}] attempt ${i+1}: 未捕获 JSON（可能 CF 拦截），重试...`);
+                } catch (e) {
+                  console.error(`  [${station}] attempt ${i+1} 异常:`, e.message);
+                }
+              }
+              if (result) {
+                fs.writeFileSync(path.join('data', `${station.toLowerCase()}.json`), result);
+                console.log(`✅ ${station} OK -> data/${station.toLowerCase()}.json`);
+              } else {
+                console.log(`❌ ${station} FAIL（保留 Gist 上次有效值）`);
               }
             }
             await browser.close().catch(() => {});
-            if (result) {
-              fs.writeFileSync('response.json', result);
-              console.log('OK: 已写入 response.json');
-            } else {
-              fs.writeFileSync('response.json', '');
-              console.log('FAIL: 5 次重试均未拿到真实数据');
-            }
           })();
           EOF
           node fetch.js
 
       # 推送到 Gist（客户端从 Gist 直拉，告别每5分钟刷仓库历史）
-      # 首次运行自动创建 Gist，并把它 id 写回 .gist_id 提交；之后每次 PATCH 更新
+      # 把所有 data/*.json 推到同一个 Gist：首次运行自动创建并写回 .gist_id，之后每次 PATCH 更新
       - name: Push to Gist
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -125,14 +132,21 @@ jobs:
             echo "⚠️ 未设置 secret GIST_TOKEN（需 gist 权限的 PAT），跳过 Gist 推送"
             exit 0
           fi
-          if ! grep -q '"airport"' response.json; then
-            echo "未抓到真实数据，跳过 Gist 推送（保留上次有效数据）"
-            exit 0
-          fi
           python3 - <<'PY'
-          import os, json, urllib.request
+          import os, json, glob, urllib.request
           tok = os.environ['GIST_TOKEN']
-          content = open('response.json', encoding='utf-8').read()
+          files = {}
+          for fp in sorted(glob.glob('data/*.json')):
+              name = os.path.basename(fp)
+              content = open(fp, encoding='utf-8').read()
+              if '"airport"' in content:
+                  files[name] = {"content": content}
+                  print(f"  待推送: {name} ({len(content)} bytes)")
+              else:
+                  print(f"  跳过 {name}（非真实数据）")
+          if not files:
+              print("无有效数据，跳过 Gist 推送（保留上次有效数据）")
+              raise SystemExit
           headers = {
               "Authorization": f"token {tok}",
               "Accept": "application/vnd.github+json",
@@ -140,16 +154,16 @@ jobs:
           }
           gid = open('.gist_id').read().strip() if os.path.exists('.gist_id') else None
           if gid:
-              payload = json.dumps({"files": {"klax.json": {"content": content}}}).encode()
+              payload = json.dumps({"files": files}).encode()
               req = urllib.request.Request(
                   f"https://api.github.com/gists/{gid}", data=payload, method="PATCH", headers=headers)
               with urllib.request.urlopen(req) as r:
                   print("Gist 更新 ->", r.status)
           else:
               payload = json.dumps({
-                  "description": "KLAX ATIS (auto-updated by GitHub Actions)",
+                  "description": "ATIS (KLAX/PANC/KORD/KJFK) auto-updated by GitHub Actions",
                   "public": True,
-                  "files": {"klax.json": {"content": content}},
+                  "files": files,
               }).encode()
               req = urllib.request.Request(
                   "https://api.github.com/gists", data=payload, method="POST", headers=headers)
